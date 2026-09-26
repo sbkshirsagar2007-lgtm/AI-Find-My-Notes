@@ -14,6 +14,7 @@ right inside the app, scrolled to the page where the topic was found.
 
 import os
 import re
+import time
 import base64
 import streamlit as st
 from pypdf import PdfReader
@@ -49,6 +50,9 @@ MIN_SCORE_TO_SHOW = 0.0
 # page (things like "a", "to", "is" would otherwise "win" a page match
 # just by being common, which is exactly the wrong kind of guessing).
 MIN_KEYWORD_LENGTH = 2
+
+# How many past searches to remember as clickable "recent search" chips.
+MAX_RECENT_QUERIES = 5
 
 # ---------------------------------------------------------
 # BACKGROUND IMAGE
@@ -162,8 +166,26 @@ def load_pdf_notes(folder_path):
 
 
 # ---------------------------------------------------------
-# STEP 5: Find WHICH PAGE the query topic actually appears on most,
-#          and build a short preview snippet from that page
+# STEP 5: Highlight the query's keywords inside a preview snippet
+# ---------------------------------------------------------
+def highlight_keywords(snippet, keywords):
+    """
+    Wraps every occurrence of any keyword (case-insensitive) in an
+    HTML <mark> tag, so the matched words stand out visually inside
+    the preview text instead of the student having to hunt for them.
+    """
+    if not keywords:
+        return snippet
+    pattern = re.compile(
+        "(" + "|".join(re.escape(word) for word in keywords) + ")",
+        re.IGNORECASE,
+    )
+    return pattern.sub(r"<mark>\1</mark>", snippet)
+
+
+# ---------------------------------------------------------
+# STEP 6: Find WHICH PAGE the query topic actually appears on most,
+#          and build a short, keyword-highlighted preview snippet
 # ---------------------------------------------------------
 def find_matching_page(page_texts, query, preview_length=PREVIEW_LENGTH):
     """
@@ -181,8 +203,10 @@ def find_matching_page(page_texts, query, preview_length=PREVIEW_LENGTH):
     topic words, or None if none of those words appear anywhere at
     all (in which case we say so honestly instead of guessing page 1).
 
-    Returns (page_number, snippet). page_number is None only when NO
-    page contains ANY of the query's keywords.
+    Returns (page_number, snippet_html). The snippet has the matched
+    keywords wrapped in <mark> tags for visual highlighting.
+    page_number is None only when NO page contains ANY of the query's
+    keywords.
     """
     query_words = [
         word for word in clean_text(query).split()
@@ -229,11 +253,13 @@ def find_matching_page(page_texts, query, preview_length=PREVIEW_LENGTH):
         return None, "(Topic words weren't found verbatim on any single page - document matched on related vocabulary.)"
 
     snippet = best_snippet if best_snippet else "(No preview available)"
-    return best_page_index + 1, (snippet + "..." if best_snippet else snippet)
+    if best_snippet:
+        snippet = highlight_keywords(snippet, query_words) + "..."
+    return best_page_index + 1, snippet
 
 
 # ---------------------------------------------------------
-# STEP 6: Search - TF-IDF + Cosine Similarity
+# STEP 7: Search - TF-IDF + Cosine Similarity
 # ---------------------------------------------------------
 def search_notes(query, file_names, file_paths, pages_texts, cleaned_texts, top_n=TOP_N_RESULTS):
     """
@@ -260,15 +286,64 @@ def search_notes(query, file_names, file_paths, pages_texts, cleaned_texts, top_
 
 
 # ---------------------------------------------------------
+# STEP 8: Run a search end-to-end (used by both the Search button
+#          and the recent-search chips), with a brief loading state
+#          and toast-style feedback
+# ---------------------------------------------------------
+def run_search(query, file_names, file_paths, pages_texts, cleaned_texts, loading_placeholder):
+    """
+    Shared search logic so both the main Search button and the
+    "recent search" chips behave identically: validate the query,
+    show a brief skeleton/shimmer loading placeholder, run the actual
+    TF-IDF search, store results in session_state (so they survive
+    later reruns from View/Download button clicks), and update the
+    "recent searches" chip list.
+    """
+    if query.strip() == "":
+        st.warning("Please type a topic or question to search.")
+        st.session_state.pop("search_results", None)
+        return
+    if len(file_names) == 0:
+        st.info("No readable PDFs are available to search.")
+        return
+
+    # Show a shimmering placeholder while the search "processes" - on a
+    # small note collection this search is nearly instant, so a short,
+    # clearly-labeled pause makes the loading state visible instead of
+    # flashing by unnoticed. Remove the time.sleep line for zero delay.
+    loading_placeholder.markdown(SKELETON_HTML, unsafe_allow_html=True)
+    time.sleep(0.35)
+
+    results = search_notes(query, file_names, file_paths, pages_texts, cleaned_texts)
+    relevant_results = [r for r in results if r[3] > MIN_SCORE_TO_SHOW]
+    loading_placeholder.empty()
+
+    st.session_state["search_results"] = relevant_results
+    st.session_state["search_query"] = query
+    
+    if relevant_results:
+        recent = st.session_state.get("recent_queries", [])
+        if query in recent:
+            recent.remove(query)
+        recent.insert(0, query)
+        st.session_state["recent_queries"] = recent[:MAX_RECENT_QUERIES]
+
+
+def mark_reindexed():
+    """Records the time the PDF index was last (re)built, for the stats strip."""
+    st.session_state["last_indexed_at"] = time.strftime("%I:%M %p")
+
+
+# ---------------------------------------------------------
 # UI HELPERS
 # ---------------------------------------------------------
 def score_color(score):
     if score >= 0.3:
-        return "#5a8f3d"   # deep olive-green - strong match
+        return "#d8a24a"   # warm gold - strong match
     elif score >= 0.1:
-        return "#c9b25a"   # muted gold - moderate match
+        return "#c97b8a"   # dusty rose - moderate match
     else:
-        return "#a37c4a"   # warm tan/brown - weak but present match
+        return "#7a4a3a"   # muted brown - weak but present match
 
 
 # A small hand-drawn SVG book, used as a header illustration. It's
@@ -279,8 +354,8 @@ BOOK_SVG = """
 <svg width="92" height="76" viewBox="0 0 92 76" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="coverLeft" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#c3d69b"/>
-      <stop offset="100%" stop-color="#6f9b50"/>
+      <stop offset="0%" stop-color="#c97b8a"/>
+      <stop offset="100%" stop-color="#9a3a4a"/>
     </linearGradient>
     <linearGradient id="coverRight" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#e2d488"/>
@@ -289,35 +364,35 @@ BOOK_SVG = """
   </defs>
   <path d="M46 14 C 36 6, 14 4, 4 8 L 4 66 C 14 62, 36 64, 46 72 Z" fill="url(#coverLeft)"/>
   <path d="M46 14 C 56 6, 78 4, 88 8 L 88 66 C 78 62, 56 64, 46 72 Z" fill="url(#coverRight)"/>
-  <path d="M46 14 L 46 72" stroke="#2f3d27" stroke-width="1.5"/>
-  <path d="M10 16 C 20 12, 34 13, 42 19" stroke="#eef1e7" stroke-width="1.4" fill="none" opacity="0.8"/>
-  <path d="M10 26 C 20 22, 34 23, 42 29" stroke="#eef1e7" stroke-width="1.4" fill="none" opacity="0.6"/>
-  <path d="M10 36 C 20 32, 34 33, 42 39" stroke="#eef1e7" stroke-width="1.4" fill="none" opacity="0.4"/>
+  <path d="M46 14 L 46 72" stroke="#3a1a1a" stroke-width="1.5"/>
+  <path d="M10 16 C 20 12, 34 13, 42 19" stroke="#f5e6e6" stroke-width="1.4" fill="none" opacity="0.8"/>
+  <path d="M10 26 C 20 22, 34 23, 42 29" stroke="#f5e6e6" stroke-width="1.4" fill="none" opacity="0.6"/>
+  <path d="M10 36 C 20 32, 34 33, 42 39" stroke="#f5e6e6" stroke-width="1.4" fill="none" opacity="0.4"/>
   <path d="M82 16 C 72 12, 58 13, 50 19" stroke="#fbf6df" stroke-width="1.4" fill="none" opacity="0.8"/>
   <path d="M82 26 C 72 22, 58 23, 50 29" stroke="#fbf6df" stroke-width="1.4" fill="none" opacity="0.6"/>
   <path d="M82 36 C 72 32, 58 33, 50 39" stroke="#fbf6df" stroke-width="1.4" fill="none" opacity="0.4"/>
 </svg>
 """
 
+# One shimmering placeholder "card" shown briefly while a search runs.
+SKELETON_HTML = """
+<div class="skeleton-card"></div>
+<div class="skeleton-card"></div>
+"""
 
-def get_background_css():
+
+def get_background_image_data():
     """
-    Reads BACKGROUND_IMAGE_FILE from ASSETS_FOLDER, base64-encodes it,
-    and returns a CSS background rule that layers a dark, semi-opaque
-    gradient OVER the photo (so the existing cream/orange text stays
-    readable) and the photo itself underneath. If the file isn't there
-    yet, falls back to the plain gradient background so the app never
-    crashes just because the image hasn't been added.
-
-    The path is resolved relative to THIS SCRIPT FILE, not the current
-    working directory - if you run `streamlit run app.py` from a
-    different folder (or launch it from an IDE), a plain "assets/..."
+    Reads BACKGROUND_IMAGE_FILE from ASSETS_FOLDER and returns its
+    base64-encoded bytes plus MIME type, or None if the file isn't
+    there. The path is resolved relative to THIS SCRIPT FILE, not the
+    current working directory - if you run `streamlit run app.py` from
+    a different folder (or launch it from an IDE), a plain "assets/..."
     path silently fails to be found because it gets looked up relative
     to wherever the terminal happens to be sitting, not next to app.py.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     image_path = os.path.join(script_dir, ASSETS_FOLDER, BACKGROUND_IMAGE_FILE)
-    plain_gradient = "linear-gradient(160deg, #16241a 0%, #0e1a12 45%, #080f0a 100%)"
 
     if not os.path.isfile(image_path):
         # Surface this loudly instead of silently falling back - a
@@ -328,21 +403,83 @@ def get_background_css():
             f"Make sure an `{ASSETS_FOLDER}/` folder sits right next to app.py "
             f"and contains a file named exactly `{BACKGROUND_IMAGE_FILE}`."
         )
-        return f"background: {plain_gradient};"
+        return None
 
     with open(image_path, "rb") as f:
         encoded = base64.b64encode(f.read()).decode()
 
     ext = os.path.splitext(image_path)[1].lstrip(".").lower()
     mime = "jpeg" if ext in ("jpg", "jpeg") else ext
+    return mime, encoded
 
+
+def get_background_css():
+    """
+    Builds the full background layer as CSS. When the photo is found,
+    it's placed on a fixed, full-viewport ::before pseudo-element
+    behind everything, with a slow "Ken Burns" zoom/pan animation -
+    the actual app containers are made transparent so this layer shows
+    through. A dark gradient ::after layer sits on top of the photo
+    (but still behind the real content) so existing text stays
+    readable. If the photo is missing, falls back to a plain static
+    gradient with no animation so the app never crashes.
+    """
+    plain_gradient = "linear-gradient(160deg, #2b0f16 0%, #1a0a0e 45%, #0d0608 100%)"
+    image_data = get_background_image_data()
+
+    if image_data is None:
+        return f"""
+            html, body {{
+                background-color: #1a0a0e !important;
+            }}
+
+            .stApp,
+            [data-testid="stAppViewContainer"],
+            [data-testid="stMain"] {{
+                background: {plain_gradient} !important;
+            }}
+        """
+
+    mime, encoded = image_data
     return f"""
-        background-image:
-            linear-gradient(160deg, rgba(10,20,13,0.90) 0%, rgba(6,12,8,0.93) 100%),
-            url("data:image/{mime};base64,{encoded}");
-        background-size: cover !important;
-        background-position: center !important;
-        background-attachment: fixed !important;
+        html, body {{
+            background-color: #1a0a0e !important;
+        }}
+
+        .stApp,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"] {{
+            background: transparent !important;
+        }}
+
+        body::before {{
+            content: "";
+            position: fixed;
+            inset: -3%;
+            background-image: url("data:image/{mime};base64,{encoded}");
+            background-size: cover;
+            background-position: center;
+            z-index: -2;
+            animation: bgKenBurns 36s ease-in-out infinite alternate;
+        }}
+
+        body::after {{
+            content: "";
+            position: fixed;
+            inset: 0;
+            background: linear-gradient(160deg, rgba(26,10,14,0.90) 0%, rgba(13,6,8,0.93) 100%);
+            z-index: -1;
+        }}
+
+        @keyframes bgKenBurns {{
+            0%   {{ transform: scale(1) translate(0, 0); }}
+            50%  {{ transform: scale(1.10) translate(-1%, 1%); }}
+            100% {{ transform: scale(1.16) translate(1%, -1%); }}
+        }}
+
+        @media (prefers-reduced-motion: reduce) {{
+            body::before {{ animation: none; }}
+        }}
     """
 
 
@@ -357,14 +494,39 @@ def inject_custom_css():
 
         html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
-        .stApp,
-        [data-testid="stAppViewContainer"],
-        [data-testid="stMain"] {
-            __BACKGROUND_CSS__
-        }
+        __BACKGROUND_CSS__
 
         [data-testid="stHeader"] {
             background: transparent;
+        }
+
+        /* Sidebar has its own separate background container that the
+           main __BACKGROUND_CSS__ rules never touch - without this it
+           stays Streamlit's default dark slate gray regardless of the
+           rest of the theme. Both testids are targeted since this
+           differs slightly across Streamlit versions. */
+        section[data-testid="stSidebar"],
+        [data-testid="stSidebarContent"] {
+            background: linear-gradient(180deg, #200a0f 0%, #140809 100%) !important;
+            border-right: 1px solid #4a1f28;
+        }
+        section[data-testid="stSidebar"] h3 {
+            font-family: 'Fraunces', serif;
+            color: #d8c77a;
+        }
+
+        /* Expanders ("PDF scan details", "Manage PDFs") also default to
+           Streamlit's own gray box styling until themed explicitly. */
+        [data-testid="stExpander"] {
+            background: #241019;
+            border: 1px solid #4a1f28 !important;
+            border-radius: 10px;
+        }
+        [data-testid="stExpander"] summary {
+            color: #f5e6e6;
+        }
+        [data-testid="stExpander"] summary:hover {
+            color: #d8c77a;
         }
 
         .app-header {
@@ -372,81 +534,165 @@ def inject_custom_css():
             padding: 1.4rem 1rem 0.5rem 1rem;
         }
         .app-header .book-icon {
-            filter: drop-shadow(0 6px 16px rgba(122, 158, 92, 0.45));
+            filter: drop-shadow(0 6px 16px rgba(154, 58, 74, 0.45));
             margin-bottom: 0.4rem;
+            animation: iconGlow 4s ease-in-out infinite;
+        }
+        @keyframes iconGlow {
+            0%, 100% { filter: drop-shadow(0 6px 16px rgba(216, 162, 74, 0.45)); }
+            50%      { filter: drop-shadow(0 6px 20px rgba(154, 58, 74, 0.55)); }
         }
         .app-header h1 {
             font-family: 'Fraunces', serif;
             font-size: 2.7rem;
             font-weight: 800;
             margin-bottom: 0.3rem;
-            color: #d8c77a;
-            text-shadow: 0 0 26px rgba(122, 158, 92, 0.35);
+            background: linear-gradient(90deg, #c97b8a, #d8c77a, #9a3a4a, #d8c77a, #c97b8a);
+            background-size: 300% 100%;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            animation: titleGradient 8s ease-in-out infinite;
+            text-shadow: 0 0 30px rgba(154, 58, 74, 0.25);
+        }
+        @keyframes titleGradient {
+            0%, 100% { background-position: 0% 50%; }
+            50%      { background-position: 100% 50%; }
         }
         .app-header p {
-            color: #c3cfb2;
+            color: #d9b7bd;
             font-size: 1.08rem;
             font-weight: 500;
         }
 
+        /* Stats strip: small pill badges showing PDF count, page count,
+           and last-indexed time under the header. */
+        .stats-strip {
+            display: flex;
+            gap: 0.6rem;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin: 0.4rem 0 1.3rem;
+        }
+        .stat-pill {
+            background: #241019;
+            border: 1px solid #522530;
+            border-radius: 999px;
+            padding: 0.35rem 1rem;
+            font-size: 0.82rem;
+            color: #d9b7bd;
+        }
+        .stat-pill b { color: #c97b8a; }
+
         div[data-testid="stTextInput"] input {
             border-radius: 12px;
-            border: 2px solid #3c4a34;
-            background: #16211a;
-            color: #eef1e7;
+            border: 2px solid #522530;
+            background: #241019;
+            color: #f5e6e6;
             padding: 0.8rem 1.1rem;
             font-size: 1rem;
         }
         div[data-testid="stTextInput"] input:focus {
-            border-color: #7ea172;
-            box-shadow: 0 0 0 3px rgba(126,161,114,0.22);
+            border-color: #9a3a4a;
+            box-shadow: 0 0 0 3px rgba(154, 58, 74, 0.20);
         }
 
-        .stButton > button {
+        /* Base button styling. Streamlit puts a plain st.button() inside
+           a div[data-testid="stButton"] wrapper, but a
+           st.form_submit_button() (used for the Search button, since
+           it lives inside st.form) gets wrapped in a DIFFERENT
+           container, div[data-testid="stFormSubmitButton"] - a rule
+           that only says ".stButton > button" silently misses it. Both
+           wrappers are targeted here so every button gets styled. */
+        div[data-testid="stButton"] > button,
+        div[data-testid="stFormSubmitButton"] > button {
             border-radius: 10px;
             font-weight: 700;
-            border: 1px solid #3c4a34;
-            color: #e6ecd9;
-            background: #16211a;
+            border: 1px solid #522530;
+            color: #f0dede;
+            background: #241019;
             transition: transform 0.12s ease, box-shadow 0.12s ease;
         }
-        .stButton > button:hover {
+        div[data-testid="stButton"] > button:hover,
+        div[data-testid="stFormSubmitButton"] > button:hover {
             transform: translateY(-1px);
-            box-shadow: 0 4px 14px rgba(126, 161, 114, 0.28);
+            box-shadow: 0 4px 14px rgba(154, 58, 74, 0.25);
         }
-        .stButton > button[kind="primary"] {
-            background: linear-gradient(90deg, #4c6b3a, #7ea172, #c3d69b);
+        /* Primary buttons: newer Streamlit versions render the primary
+           style as data-testid="stBaseButton-primary" instead of the
+           older kind="primary" HTML attribute - both are matched here
+           so this keeps working across Streamlit versions. */
+        div[data-testid="stButton"] > button[kind="primary"],
+        div[data-testid="stFormSubmitButton"] > button[kind="primary"],
+        div[data-testid="stButton"] > button[data-testid="stBaseButton-primary"],
+        div[data-testid="stFormSubmitButton"] > button[data-testid="stBaseButton-primary"] {
+            background: linear-gradient(90deg, #3a1420, #6b2431, #4a1620);
             background-size: 200% 200%;
             border: none;
-            color: #12200f;
+            color: #e8c98a;
             font-size: 1.02rem;
             padding: 0.55rem 0;
         }
-        .stButton > button[kind="primary"]:hover {
+        div[data-testid="stButton"] > button[kind="primary"]:hover,
+        div[data-testid="stFormSubmitButton"] > button[kind="primary"]:hover,
+        div[data-testid="stButton"] > button[data-testid="stBaseButton-primary"]:hover,
+        div[data-testid="stFormSubmitButton"] > button[data-testid="stBaseButton-primary"]:hover {
             background-position: 100% 0;
         }
+
+        /* NOTE: an earlier version tried a ".chip-row div[...] > button"
+           rule here, wrapping the chip buttons in an st.markdown() div.
+           That never actually worked - st.markdown() inserts a sibling
+           element, not a real parent, so Streamlit's buttons never end
+           up nested inside it. Removed; the recent-search chips just
+           use the standard button styling above, which already looks
+           right now that it's actually applying (see the fix below).
+           The narrow st.columns() width is what gives them their
+           compact, chip-like look. */
 
         div[data-testid="stDownloadButton"] > button {
             border-radius: 10px;
             font-weight: 700;
-            background: linear-gradient(90deg, #3f6b2a, #6fa050);
+            background: linear-gradient(90deg, #8a5a1f, #d8a24a);
             border: none;
-            color: #0c160a;
+            color: #2a1608;
+        }
+
+        /* Shimmering placeholder shown briefly while a search runs. */
+        .skeleton-card {
+            height: 84px;
+            border-radius: 16px;
+            margin-bottom: 0.8rem;
+            border: 1px solid #4a1f28;
+            background: linear-gradient(100deg, #241019 30%, #22331f 50%, #241019 70%);
+            background-size: 200% 100%;
+            animation: shimmer 1.1s linear infinite;
+        }
+        @keyframes shimmer {
+            0%   { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
         }
 
         .result-card {
-            background: linear-gradient(150deg, #182a19 0%, #0e1a10 100%);
-            border: 1px solid #33422e;
+            background: linear-gradient(150deg, #2e131a 0%, #170a0d 100%);
+            border: 1px solid #4a1f28;
+            border-left: 3px solid #7a2e3a;
             border-radius: 16px;
             padding: 1.3rem 1.5rem;
             margin-bottom: 0.8rem;
             box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+            opacity: 0;
+            transform: translateY(10px);
+            animation: cardFadeIn 0.45s ease forwards;
+        }
+        @keyframes cardFadeIn {
+            to { opacity: 1; transform: translateY(0); }
         }
         .result-title {
             font-family: 'Fraunces', serif;
             font-size: 1.15rem;
             font-weight: 700;
-            color: #eef1e7;
+            color: #f5e6e6;
             margin-bottom: 0.5rem;
         }
         .score-badge {
@@ -459,32 +705,60 @@ def inject_custom_css():
             margin-top: 0.2rem;
         }
         .preview-text {
-            color: #d6e0c8;
+            color: #e8cdd2;
             font-size: 0.92rem;
             margin-top: 0.8rem;
             line-height: 1.55;
-            background: rgba(126, 161, 114, 0.10);
-            border-left: 3px solid #7ea172;
+            background: rgba(154, 58, 74, 0.08);
+            border-left: 3px solid #9a3a4a;
             padding: 0.6rem 0.9rem;
             border-radius: 0 10px 10px 0;
         }
-        .stCaption, .st-emotion-cache-1629p8f { color: #c3cfb2 !important; }
+        .preview-text mark {
+            background: #d8c77a;
+            color: #1a1400;
+            padding: 0 0.2em;
+            border-radius: 3px;
+            font-weight: 700;
+        }
+        .stCaption, .st-emotion-cache-1629p8f { color: #d9b7bd !important; }
+
+        /* Streamlit's built-in st.error/warning/info/success boxes ship
+           with red/blue/orange colors baked in via inline styles, which
+           clash with an olive theme. Overriding with !important on the
+           stable data-testid wrapper (rather than the unstable, version-
+           specific emotion-cache class names) recolors all four to a
+           single consistent olive-toned card so nothing reads as an
+           off-theme red/blue alert. */
+        [data-testid="stAlert"] {
+            background-color: #2e1219 !important;
+            border: 1px solid #522530 !important;
+            border-left: 4px solid #9a3a4a !important;
+            border-radius: 10px !important;
+            color: #f5e6e6 !important;
+        }
+        [data-testid="stAlert"] * {
+            color: #f5e6e6 !important;
+        }
+        [data-testid="stAlert"] svg {
+            fill: #c97b8a !important;
+        }
         </style>
     """
     css = css.replace("__BACKGROUND_CSS__", get_background_css())
     st.markdown(css, unsafe_allow_html=True)
 
 
-def render_result_card(rank, file_name, score, page_number):
+def render_result_card(rank, file_name, score, page_number, animation_delay):
     color = score_color(score)
     page_label = f"📄 Page {page_number}" if page_number else "📄 No exact page match"
     st.markdown(f"""
-        <div class="result-card">
+        <div class="result-card" style="animation-delay:{animation_delay}s;">
             <div class="result-title">🏆 {rank}. {file_name}</div>
-            <span class="score-badge" style="background:{color}; color:#0e1117;">
+            <span class="score-badge" style="background:{color}; color:#1a0e0e;">
                 ⭐ Similarity: {score:.2f}
             </span>
-            <span class="score-badge" style="background:#2d3a26; color:#dde6c9;">
+            <span class="score-badge" style="background:#3a1a22; color:#f0d8dc;">
                 {page_label}
             </span>
         </div>
@@ -517,6 +791,121 @@ def render_pdf_viewer(file_path, page_number):
 
 
 # ---------------------------------------------------------
+# SIDEBAR: diagnostics + upload/delete management
+# ---------------------------------------------------------
+def render_sidebar(file_names, file_paths, diagnostics):
+    """
+    Everything that's about MANAGING the note collection (rather than
+    searching it) lives in the sidebar, so the main area stays focused
+    on search + results.
+    """
+    with st.sidebar:
+        st.markdown("### 📚 Notes Library")
+
+        if st.button("🔄 Refresh index", use_container_width=True, key="refresh_button"):
+            st.cache_data.clear()
+            st.session_state.pop("search_results", None)
+            mark_reindexed()
+            st.rerun()
+
+        with st.expander("🔍 PDF scan details"):
+            for item in diagnostics:
+                if item["error"]:
+                    st.write(f"❌ **{item['name']}** — could not open: {item['error']}")
+                elif item["chars_extracted"] == 0:
+                    st.write(
+                        f"⚠️ **{item['name']}** — {item['pages']} page(s), "
+                        f"but 0 characters of text extracted (likely a scanned/image-only PDF)."
+                    )
+                else:
+                    st.write(
+                        f"✅ **{item['name']}** — {item['pages']} page(s), "
+                        f"{item['chars_extracted']} characters extracted."
+                    )
+
+        with st.expander("🛠️ Manage PDFs (add or remove)"):
+            tab_add, tab_remove = st.tabs(["➕ Add", "🗑️ Remove"])
+
+            with tab_add:
+                st.caption(
+                    "Uploaded files are added to dataset/ and become searchable "
+                    "immediately. (On Streamlit Cloud, uploads live only until the "
+                    "app restarts or sleeps - for permanent notes, add them to "
+                    "dataset/ in your GitHub repo instead.)"
+                )
+                uploaded_files = st.file_uploader(
+                    "Choose one or more PDF files",
+                    type=["pdf"],
+                    accept_multiple_files=True,
+                    key="pdf_uploader",
+                )
+                if uploaded_files:
+                    if st.button("📥 Add to my notes", use_container_width=True, key="add_uploaded_pdfs"):
+                        added, skipped = [], []
+                        for uploaded_file in uploaded_files:
+                            # os.path.basename strips any folder path a browser might send,
+                            # so this can never write outside the dataset folder.
+                            safe_name = os.path.basename(uploaded_file.name)
+                            if not safe_name.lower().endswith(".pdf"):
+                                continue
+                            dest_path = os.path.join(DATASET_FOLDER, safe_name)
+                            if os.path.exists(dest_path):
+                                skipped.append(safe_name)
+                                continue
+                            with open(dest_path, "wb") as f:
+                                f.write(uploaded_file.getbuffer())
+                            added.append(safe_name)
+
+                        # The index was built with @st.cache_data, so it has to be
+                        # cleared explicitly - otherwise the newly-saved files would
+                        # sit on disk but stay invisible to search until the cache
+                        # expired on its own.
+                        st.cache_data.clear()
+                        st.session_state.pop("search_results", None)
+                        mark_reindexed()
+
+                        # st.toast() shows a small, auto-dismissing notification
+                        # (rather than a static box that sits on the page) - it's
+                        # specifically designed to survive the st.rerun() below.
+                        if added:
+                            st.toast(f"Added {len(added)} PDF(s): {', '.join(added)}", icon="✅")
+                        if skipped:
+                            st.toast(f"Skipped (already exists): {', '.join(skipped)}", icon="ℹ️")
+                        st.rerun()
+
+            with tab_remove:
+                if len(file_names) == 0:
+                    st.caption("No PDFs are currently indexed.")
+                else:
+                    st.caption("Removing a file deletes it from the dataset/ folder on disk.")
+                    for name, path in zip(file_names, file_paths):
+                        col_name, col_delete = st.columns([4, 1])
+                        with col_name:
+                            st.write(f"📄 {name}")
+                        with col_delete:
+                            # Delete happens in two clicks: first click arms a
+                            # confirmation for THIS specific file only, so a stray
+                            # click can't silently wipe out a student's notes.
+                            confirm_key = f"confirm_delete_{name}"
+                            if st.session_state.get(confirm_key):
+                                if st.button("✅", key=f"confirm_btn_{name}", use_container_width=True, help=f"Confirm delete {name}"):
+                                    try:
+                                        os.remove(path)
+                                        st.cache_data.clear()
+                                        st.session_state.pop("search_results", None)
+                                        st.session_state.pop(confirm_key, None)
+                                        mark_reindexed()
+                                        st.toast(f"Removed {name}.", icon="🗑️")
+                                        st.rerun()
+                                    except Exception as error:
+                                        st.error(f"Could not remove {name}: {error}")
+                            else:
+                                if st.button("🗑️", key=f"delete_btn_{name}", use_container_width=True, help=f"Remove {name}"):
+                                    st.session_state[confirm_key] = True
+                                    st.rerun()
+
+
+# ---------------------------------------------------------
 # STREAMLIT USER INTERFACE
 # ---------------------------------------------------------
 def main():
@@ -531,6 +920,9 @@ def main():
         </div>
     """, unsafe_allow_html=True)
 
+    st.session_state.setdefault("last_indexed_at", time.strftime("%I:%M %p"))
+    st.session_state.setdefault("recent_queries", [])
+
     os.makedirs(DATASET_FOLDER, exist_ok=True)
     file_names, file_paths, pages_texts, cleaned_texts, diagnostics = load_pdf_notes(DATASET_FOLDER)
 
@@ -539,74 +931,80 @@ def main():
             f"No PDF files found. Please add your PDF notes to the "
             f"'{DATASET_FOLDER}/' folder and refresh the page."
         )
+        render_sidebar(file_names, file_paths, diagnostics)
         return
 
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.caption(f"📁 {len(file_names)} of {len(diagnostics)} PDF(s) indexed and searchable.")
-    with col2:
-        if st.button("🔄 Refresh", use_container_width=True, key="refresh_button"):
-            st.cache_data.clear()
-            st.session_state.pop("search_results", None)
-            st.rerun()
+    # Stats strip - quick at-a-glance numbers under the header
+    total_pages = sum(item["pages"] for item in diagnostics)
+    st.markdown(f"""
+        <div class="stats-strip">
+            <div class="stat-pill">📁 <b>{len(file_names)}</b> PDFs indexed</div>
+            <div class="stat-pill">📄 <b>{total_pages}</b> pages scanned</div>
+            <div class="stat-pill">🕒 Updated <b>{st.session_state['last_indexed_at']}</b></div>
+        </div>
+    """, unsafe_allow_html=True)
 
-    # Diagnostics - helps confirm PDFs are actually being read correctly
-    with st.expander("🔍 PDF scan details (open this if results look wrong)"):
-        for item in diagnostics:
-            if item["error"]:
-                st.write(f"❌ **{item['name']}** — could not open: {item['error']}")
-            elif item["chars_extracted"] == 0:
-                st.write(
-                    f"⚠️ **{item['name']}** — {item['pages']} page(s), "
-                    f"but 0 characters of text extracted (likely a scanned/image-only PDF)."
-                )
-            else:
-                st.write(
-                    f"✅ **{item['name']}** — {item['pages']} page(s), "
-                    f"{item['chars_extracted']} characters extracted."
-                )
+    render_sidebar(file_names, file_paths, diagnostics)
 
-    query = st.text_input(
-        "Enter a topic or question:",
-        placeholder="e.g. Explain heuristic search and shortest path",
-    )
-    search_clicked = st.button("🔎 Search", type="primary", use_container_width=True, key="search_button")
+    # Wrapped in st.form so pressing Enter inside the text box submits the
+    # search - a plain st.text_input + st.button outside a form only
+    # responds to the button click, not the Enter key.
+    with st.form(key="search_form"):
+        query = st.text_input(
+            "Enter a topic or question:",
+            key="query_text",
+            placeholder="e.g. Explain heuristic search and shortest path",
+        )
+        search_clicked = st.form_submit_button(
+            "🔎 Search", type="primary", use_container_width=True
+        )
+
+    # Recent-search chips - click one to instantly re-run that search.
+    # These are plain st.button() calls (not form_submit_button), which
+    # is why they have to live outside the st.form block above - a form
+    # can only contain one submit button.
+    recent_queries = st.session_state.get("recent_queries", [])
+    chip_clicked_query = None
+    if recent_queries:
+        st.caption("Recent searches:")
+        chip_columns = st.columns(len(recent_queries))
+        for column, past_query in zip(chip_columns, recent_queries):
+            with column:
+                if st.button(past_query, key=f"chip_{past_query}"):
+                    chip_clicked_query = past_query
+
+    # A single placeholder used for the brief shimmer/skeleton loading
+    # effect right before results are drawn below it.
+    loading_placeholder = st.empty()
 
     # IMPORTANT: Streamlit reruns the whole script on every click (even
     # clicking "View PDF" below). st.button() is only True for the exact
-    # run it was clicked on, so we save the search results into
-    # st.session_state - that way they stay visible even after you click
+    # run it was clicked on, so search results are stored in
+    # st.session_state - that way they stay visible even after clicking
     # a "View PDF" or "Download" button on one of the results.
     if search_clicked:
-        if query.strip() == "":
-            st.warning("Please type a topic or question to search.")
-            st.session_state.pop("search_results", None)
-        elif len(file_names) == 0:
-            st.info("No readable PDFs are available to search.")
-        else:
-            results = search_notes(query, file_names, file_paths, pages_texts, cleaned_texts)
-            relevant_results = [r for r in results if r[3] > MIN_SCORE_TO_SHOW]
-            st.session_state["search_results"] = relevant_results
-            st.session_state["search_query"] = query
+        run_search(query, file_names, file_paths, pages_texts, cleaned_texts, loading_placeholder)
+    elif chip_clicked_query is not None:
+        run_search(chip_clicked_query, file_names, file_paths, pages_texts, cleaned_texts, loading_placeholder)
 
     # Render whatever the last search produced (persists across reruns)
     if "search_results" in st.session_state:
         relevant_results = st.session_state["search_results"]
-        last_query = st.session_state.get("search_query", "")
 
         if not relevant_results:
             st.error(
                 "No relevant notes were found. This usually means none of your "
                 "PDFs contain any of the words in your query - try different "
-                "keywords, or open 'PDF scan details' above to check the PDFs "
-                "were read correctly."
+                "keywords, or open 'PDF scan details' in the sidebar to check the "
+                "PDFs were read correctly."
             )
         else:
+            last_query = st.session_state.get("search_query", "")
             st.subheader("Results")
             for rank, (file_name, file_path, page_texts, score) in enumerate(relevant_results, start=1):
                 page_number, preview = find_matching_page(page_texts, last_query)
 
-                render_result_card(rank, file_name, score, page_number)
+                render_result_card(rank, file_name, score, page_number, animation_delay=(rank - 1) * 0.08)
                 st.markdown(f'<div class="preview-text">{preview}</div>', unsafe_allow_html=True)
 
                 view_key = f"view_open_{rank}_{file_name}"
