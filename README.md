@@ -65,7 +65,7 @@ ai-find-my-notes/
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/<your-username>/ai-find-my-notes.git
+   git clone https://github.com/sbkshirsagar2007-lgtm/ai-find-my-notes.git
    cd ai-find-my-notes
    ```
 
@@ -110,7 +110,7 @@ ai-find-my-notes/
 
 ## 🌐 Live Demo
 
-Deployed on Streamlit Community Cloud: `(https://findmynotes-ai.streamlit.app/)`
+Deployed on Streamlit Community Cloud:[try Ai Find MY Notes](https://findmynotes-ai.streamlit.app/)
 
 ## 👤 Author
 
