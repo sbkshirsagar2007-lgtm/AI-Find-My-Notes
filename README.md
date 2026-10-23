@@ -110,7 +110,7 @@ ai-find-my-notes/
 
 ## 🌐 Live Demo
 
-Deployed on Streamlit Community Cloud: `<add your app link here after deploying>`
+Deployed on Streamlit Community Cloud: `(https://findmynotes-ai.streamlit.app/)`
 
 ## 👤 Author
 
